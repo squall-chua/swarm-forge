@@ -1,0 +1,541 @@
+#!/bin/sh
+# swarm - run a SwarmForge role chain on any agent CLI, or install the roles
+#         as that CLI's native subagents.
+#
+#   ./swarm run 6 "add a login flow"
+#   ./swarm install opencode
+#   ./swarm show 4
+#
+# ponytail: a sequential chain is a for-loop. No daemon, no worktrees, no tmux.
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CONF="$DIR/packs.conf"
+LOG=''   # set by cmd_run; say() copies the run banner there as well as stderr.
+
+say() { printf '%s\n' "$*" >&2; [ -n "$LOG" ] && printf '%s\n' "$*" >> "$LOG"; return 0; }
+die() { say "swarm: $*"; exit 1; }
+
+chain_of()   { awk -v p="$1" '$1=="pack" && $2==p { $1=""; $2=""; print }' "$CONF"; }
+backend_of() { awk -v r="$1" '$1=="backend" && $2==r { print $3; exit }' "$CONF"; }
+conf_inter()  { awk -v r="$1" '$1=="interactive" && $2==r { print 1; exit }' "$CONF"; }
+
+# One swarm per working tree. Two in the same tree see each other's in-flight
+# files as their own uncommitted changes and both die at the first role, with an
+# error that says nothing about the real cause.
+LOCK=docs/handoffs/.running
+
+# lock_holder -- print "<pid-or-dash> <task>" when the tree is claimed, else fail.
+# A `swarm run` writes its own pid, so a crash frees the tree by itself. An
+# orchestrator session has no pid a shell can watch, so `swarm lock` writes "-"
+# and the session must release it with `swarm unlock`.
+lock_holder() {
+  [ -f "$LOCK" ] || return 1
+  IFS=' ' read -r lpid ltask < "$LOCK" || return 1
+  [ -n "${lpid:-}" ] || return 1
+  case $lpid in
+    -) : ;;
+    *) kill -0 "$lpid" 2>/dev/null || return 1 ;;
+  esac
+  printf 'holder %s, task %s\n' "$lpid" "${ltask:-?}"
+}
+
+# can_tty <backend> <what> -- may this hand the terminal over? Falls back to
+# headless with the reason rather than hanging or garbling in a pipe.
+can_tty() {
+  case "$1" in
+    claude|codex) ;;
+    *) say "swarm: '$1' has no verified interactive form - running $2 headless."; return 1 ;;
+  esac
+  [ -t 0 ] && return 0
+  say "swarm: no terminal - running $2 headless; it cannot ask you anything."
+  return 1
+}
+conf_model() { awk -v r="$1" '$1=="model"   && $2==r { print $3; exit }' "$CONF"; }
+desc_of()    { sed -n '1s/^> *//p' "$1"; }
+
+# qstr <text> -- wrap for a YAML or TOML double-quoted scalar. Role descriptions
+# are prose: an unquoted `hardener: cleanup` ends the key and the whole agent
+# file stops parsing, so the agent silently never loads.
+qstr() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+
+# jfield <key> -- read one string field off a JSON hook payload on stdin.
+# Whitespace around the colon is optional because the payload may be pretty-printed.
+jfield() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+body_of()    { sed '1,2d' "$1"; }
+
+# model_of <role> [pack] -- "model <pack>.<role>" wins over "model <role>".
+model_of() {
+  m=''
+  if [ -n "${2:-}" ]; then m=$(conf_model "$2.$1"); fi
+  if [ -z "$m" ];    then m=$(conf_model "$1");     fi
+  printf '%s\n' "$m"
+}
+
+# role_file <role> <pack> -- a pack override wins when roles/<role>.<pack>.md exists.
+# The 2-pack is not the 6-pack minus roles; its coder and cleaner are different jobs.
+role_file() {
+  if [ -f "$DIR/roles/$1.$2.md" ]; then printf '%s\n' "$DIR/roles/$1.$2.md"
+  else                                  printf '%s\n' "$DIR/roles/$1.md"
+  fi
+}
+
+# run_cli <backend> <model-or-empty> <prompt> [interactive]
+# Each CLI names its model flag differently, hence the table.
+#
+# Interactive means: drop the headless flag and hand this role the terminal, so
+# it can ask the user questions. The chain is a foreground loop running one role
+# at a time, so the role simply owns the terminal until the user exits it. Only
+# claude and codex are listed; the caller checks that before asking for it.
+run_cli() {
+  be=$1; mdl=$2; prompt=$3
+  if [ -n "${4:-}" ]; then
+    if [ -n "$mdl" ]; then
+      case "$be" in
+        claude) set -- --model "$mdl" "$prompt" ;;
+        codex)  set -- -m "$mdl" "$prompt" ;;
+        *) die "'$be' has no interactive form. See run_cli() in $0." ;;
+      esac
+    else
+      set -- "$prompt"
+    fi
+    "$be" "$@"
+    return
+  fi
+  if [ -n "$mdl" ]; then
+    case "$be" in
+      claude)   set -- --model "$mdl" -p "$prompt" ;;
+      codex)    set -- exec -m "$mdl" "$prompt" ;;
+      opencode) set -- run  -m "$mdl" "$prompt" ;;
+      agy)      set -- --model "$mdl" -p "$prompt" ;;
+      copilot)  set -- --model "$mdl" -p "$prompt" ;;
+      *) die "unknown backend '$be'. Add it to run_cli() in $0." ;;
+    esac
+  else
+    case "$be" in
+      claude|agy|copilot) set -- -p "$prompt" ;;
+      codex)              set -- exec "$prompt" ;;
+      opencode)           set -- run "$prompt" ;;
+      *) die "unknown backend '$be'. Add it to run_cli() in $0." ;;
+    esac
+  fi
+  "$be" "$@"
+}
+
+# orch_body <pack-or-empty> <task-or-empty>
+# The subagent-variant command text. With no pack, the $1/$ARGUMENTS header is
+# replaced by a literal instruction (for hosts with no command-file expansion).
+# With a pack, the task is baked straight in.
+#
+# The task goes through the environment, not `awk -v`: awk expands backslash
+# escapes in a -v assignment, so `fix the \n handling in C:\Users` would reach
+# the orchestrator with a real newline in it and the backslashes eaten. This is
+# the one entry point where the user's own wording has to survive verbatim.
+orch_body() {
+  swarm_task=$2 awk -v pack="$1" '
+    NR <= 2 { next }                      # drop the "> description" line and its blank
+    /^Start the SwarmForge/ {
+      if (pack == "") {
+        print "Start a SwarmForge pack. The pack number and the task follow this"
+        print "prompt, in the form `<2|4|6>-pack: <task>`."
+      } else {
+        printf "Start the SwarmForge %s-pack on this task:\n\n%s\n", pack, ENVIRON["swarm_task"]
+      }
+      drop = 1; next
+    }
+    drop && /^in: \$ARGUMENTS$/ { drop = 0; next }
+    { print }
+  ' "$DIR/commands/swarm-subagents.md"
+}
+
+# slug <task text>  -> short stable task name
+slug() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-' | cut -c1-32 | sed 's/-*$//'
+}
+
+# prompt_for <role-file> <role> <task-name> <task> <prev-report-or-empty> <pack> <chain>
+# The chain is spelled out because several role files carry a section that
+# applies only when some other role is absent — the specifier's "no QA role" and
+# the architect's "no hardener". Without the chain a role cannot tell which pack
+# it is in, so those sections could never fire here. The two orchestrator
+# variants inject the same fact as a pack adjustment in the spawn prompt.
+prompt_for() {
+  cl=''
+  for r in $7; do cl="${cl:+$cl -> }$r"; done
+  cat "$DIR/constitution.md"
+  printf '\n---\n\n'
+  body_of "$1"
+  printf '\n---\n\n## This task\n\nTask name: `%s`\n\n%s\n' "$3" "$4"
+  printf '\nYou are the **%s** in the **%s-pack**. The whole chain is: %s.\n' "$2" "$6" "$cl"
+  printf 'If your role file has a section that applies when some role is missing, check\nthat chain and apply the section only when the role really is absent.\n'
+  if [ -n "$5" ]; then
+    printf '\nThe previous role left its report at `%s`. Read it before you start.\n' "$5"
+  fi
+  printf '\nWrite your report to `docs/handoffs/%s-%s.md`, then stop.\n' "$3" "$2"
+}
+
+report_commit() { sed -n 's/^commit: *//p' "$1" 2>/dev/null | head -1; }
+
+# report_ok <report-path> -- a report counts as finished only when it names a
+# commit that HEAD still stands on. A half-written file must not be skipped on
+# resume, and neither must a role whose work was thrown away: after a
+# `git reset --hard` the abandoned commit still resolves, so merely existing is
+# not enough -- resume would skip roles whose work is no longer in the tree and
+# build the rest of the chain on top of the hole.
+report_ok() {
+  [ -f "$1" ] || return 1
+  c=$(report_commit "$1")
+  [ -n "$c" ] || return 1
+  git merge-base --is-ancestor "$c^{commit}" HEAD >/dev/null 2>&1
+}
+
+# report_at_head <report-path> -- does the report name the commit HEAD is on?
+# Resolve both sides: a role that wrote a correct sha at another width -- `git
+# log -1 --format=%h` gives 7, `git rev-parse HEAD` gives 40 -- means the same
+# commit, and comparing the strings would stop a chain that is perfectly fine.
+report_at_head() {
+  c=$(report_commit "$1") || return 1
+  [ -n "$c" ] || return 1
+  rc=$(git rev-parse -q --verify "$c^{commit}" 2>/dev/null) || return 1
+  [ "$rc" = "$(git rev-parse -q --verify HEAD 2>/dev/null)" ]
+}
+
+# check_role <role> [report-path] -- the two things that break a chain: work left
+# uncommitted, and no report naming the commit the chain is now on. Given no
+# report path it finds the role's own report by glob, so a hook that knows only
+# the role name can call it.
+#
+# HEAD, not "a real commit", is the test. When a role finishes, HEAD is its
+# commit. A role that never committed leaves HEAD on the previous role's commit
+# and has no report of its own naming it. A role that had nothing to commit still
+# passes: its report names the commit it verified, which is HEAD unchanged.
+check_role() {
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    say "swarm: role '$1' left uncommitted changes. Commit or discard them."
+    return 1
+  fi
+  head=$(git rev-parse --short=10 HEAD 2>/dev/null) || head=''
+  if [ -n "${2:-}" ]; then
+    if report_at_head "$2"; then return 0; fi
+    say "swarm: role '$1' wrote no usable report at $2. It needs a 'commit: $head' line."
+    return 1
+  fi
+  # An installed 2-pack agent is named coder-2pack; its report may use either
+  # name. Strip only that suffix -- cutting at the first hyphen would also match
+  # someone else's `coder-reviewer` and claim a subagent that is not ours.
+  for r in docs/handoffs/*-"$1".md docs/handoffs/*-"${1%-2pack}".md; do
+    [ -f "$r" ] || continue
+    if report_at_head "$r"; then return 0; fi
+  done
+  say "swarm: role '$1' left no report naming the current commit $head. Commit your work, then write docs/handoffs/<task>-$1.md starting with 'commit: $head'."
+  return 1
+}
+
+# cmd_run <resume-flag> <pack> <task...>
+# There is no daemon and no queue, so the two things that actually break a chain
+# are checked here instead: work left uncommitted, and a report naming no commit.
+cmd_run() {
+  res=$1; shift
+  [ $# -ge 2 ] || die 'usage: swarm run <pack> "<task>"'
+  pack=$1; shift
+  task=$*
+  chain=$(chain_of "$pack")
+  [ -n "$chain" ] || die "no pack '$pack' in packs.conf"
+  git rev-parse --git-dir >/dev/null 2>&1 || die 'not a git repository; every role commits before it hands off'
+
+  name=$(slug "$task")
+  # Every report path is built from this. An empty name gives every such task the
+  # same namespace -- docs/handoffs/-coder.md -- so a later `swarm resume` would
+  # skip roles because some earlier task's reports satisfy the check.
+  [ -n "$name" ] || die 'that task has no usable characters for a name; give it some words'
+  mkdir -p docs/handoffs
+  # Reports are working state, not project history. Keep them out of git so a
+  # role's commit can never sweep them in.
+  [ -f docs/handoffs/.gitignore ] || echo '*' > docs/handoffs/.gitignore
+  if h=$(lock_holder); then
+    die "another swarm already owns this working tree ($h).
+       Two swarms cannot share a tree. Give this one its own:
+         d=\$($0 worktree \"$task\") && cd \"\$d\" && $0 run $pack \"$task\"
+       If that swarm is gone, release the tree with: $0 unlock"
+  fi
+  printf '%s %s\n' "$$" "$name" > "$LOCK"
+  trap 'rm -f "$LOCK"' EXIT INT TERM
+
+  LOG="docs/handoffs/$name.log"
+  fix="Fix it, then: swarm resume $pack \"$task\""
+  say ''
+  say "=== $(date '+%F %T')  ${res:+resuming }$pack-pack: $task ==="
+  prev=''
+  for role in $chain; do
+    rp="docs/handoffs/$name-$role.md"
+    if [ -n "$res" ] && report_ok "$rp"; then
+      say "=== $(date '+%T') $role - done already, skipped ==="
+      prev=$rp; continue
+    fi
+    be=$(backend_of "$role") || be=''
+    [ -n "$be" ] || be=claude
+    mdl=$(model_of "$role" "$pack")
+    command -v "$be" >/dev/null 2>&1 || die "$be is not installed (role: $role)"
+
+    # A role marked interactive gets the terminal so it can ask the user.
+    ia=''
+    if [ -n "$(conf_inter "$role")" ] && can_tty "$be" "'$role'"; then ia=1; fi
+
+    say ''
+    say "=== $(date '+%T') $role [$be${mdl:+ $mdl}${ia:+ interactive}] ==="
+    rf=$(role_file "$role" "$pack")
+    run_cli "$be" "$mdl" "$(prompt_for "$rf" "$role" "$name" "$task" "$prev" "$pack" "$chain")" "$ia" \
+      || die "role '$role' failed; chain stopped. $fix"
+    check_role "$role" "$rp" || die "chain stopped after '$role'. $fix"
+    prev=$rp
+  done
+  say ''
+  say "=== $(date '+%T') chain complete: $name ==="
+}
+
+cmd_install() {
+  [ $# -eq 1 ] || die 'usage: swarm install <claude|opencode|agy|codex|copilot>'
+  # variants: which command shapes this CLI can run.
+  #   team      = shared task list, roles message each other  (Claude Code only)
+  #   subagents = session invokes roles one at a time         (any CLI)
+  # aext/cext: this CLI's file extension for role agents and for commands.
+  case $1 in
+    claude)   adir=.claude/agents;   cdir=.claude/commands;   aext=.md; cext=.md;       variants='team subagents' ;;
+    opencode) adir=.opencode/agents; cdir=.opencode/commands; aext=.md; cext=.md;       variants='subagents' ;;
+    agy)      adir=.agents/agents;   cdir=.agents/commands;   aext=.md; cext=.md;       variants='subagents' ;;
+    codex)    adir=.codex/agents;    cdir=.codex/prompts;     aext=.toml; cext=.md;     variants='subagents' ;;
+    # A copilot custom agent cannot delegate to another, so the orchestrator is
+    # not an agent. Copilot declined prompt files (copilot-cli#618) in favour of
+    # skills, so the orchestrator is a skill: .github/skills/swarm/SKILL.md.
+    copilot)  adir=.github/agents;   cdir=.github/skills;     aext=.agent.md; cext=/SKILL.md; variants='subagents' ;;
+    *) die "no installer for '$1'. Known: claude, opencode, agy, codex, copilot." ;;
+  esac
+
+  mkdir -p "$adir" "$cdir"
+  for f in "$DIR"/roles/*.md; do
+    stem=$(basename "$f" .md)
+    # roles/coder.2.md -> agent "coder-2pack"; roles/coder.md -> agent "coder".
+    # A pack override knows its pack, so it can take a pack-scoped model.
+    case $stem in
+      *.*) role="${stem%%.*}-${stem##*.}pack"; mdl=$(model_of "${stem%%.*}" "${stem##*.}") ;;
+      *)   role=$stem;                         mdl=$(model_of "$stem") ;;
+    esac
+    desc=$(desc_of "$f")
+    # Omit the field entirely when no model is set, so the CLI's default wins.
+    # Literal newlines: $(printf) would strip the trailing one.
+    # Copilot's .agent.md frontmatter has no documented model field.
+    [ "$1" = copilot ] && mdl=''
+    if [ -z "$mdl" ];         then mline=''
+    elif [ "$1" = codex ];    then mline="model = \"$mdl\"
+"
+    else                           mline="model: $mdl
+"
+    fi
+    case $1 in
+      claude|copilot)
+        { printf -- '---\nname: %s\ndescription: %s\n%s---\n\n' "$role" "$(qstr "$desc")" "$mline"
+          cat "$DIR/constitution.md"; printf '\n---\n\n'; body_of "$f"
+        } > "$adir/$role$aext" ;;
+      opencode)
+        { printf -- '---\ndescription: %s\nmode: subagent\n%s---\n\n' "$(qstr "$desc")" "$mline"
+          cat "$DIR/constitution.md"; printf '\n---\n\n'; body_of "$f"
+        } > "$adir/$role$aext" ;;
+      agy)
+        { printf -- '---\nname: %s\ndescription: %s\nsubagent: true\n%s---\n\n' "$role" "$(qstr "$desc")" "$mline"
+          cat "$DIR/constitution.md"; printf '\n---\n\n'; body_of "$f"
+        } > "$adir/$role$aext" ;;
+      codex)
+        { printf 'name = "%s"\ndescription = %s\n%s' "$role" "$(qstr "$desc")" "$mline"
+          printf 'developer_instructions = """\n'
+          cat "$DIR/constitution.md"; printf '\n---\n\n'; body_of "$f"
+          printf '"""\n'
+        } > "$adir/$role$aext" ;;
+    esac
+  done
+
+  # The starting session is the orchestrator, so each variant ships as a command.
+  for v in $variants; do
+    src="$DIR/commands/swarm-$v.md"
+    case "$variants" in
+      'team subagents') [ "$v" = team ] && name=swarm || name=swarm-subagents ;;
+      *) name=swarm ;;
+    esac
+    desc=$(sed -n '1s/^> *//p' "$src")
+    [ "$1" = copilot ] && mkdir -p "$cdir/$name"
+    { case $1 in
+        claude)  printf -- '---\nargument-hint: "2 | 4 | 6 <task>"\ndescription: %s\n---\n\n' "$desc" ;;
+        # disable-model-invocation keeps this user-invoked only, like a command.
+        copilot) printf -- '---\nname: %s\ndescription: %s\nargument-hint: "2 | 4 | 6 <task>"\ndisable-model-invocation: true\n---\n\n' "$name" "$desc" ;;
+        *)       printf -- '---\ndescription: %s\n---\n\n' "$desc" ;;
+      esac
+      # $1/$ARGUMENTS are command-file placeholders. Nothing expands them in a
+      # plain prompt, so copilot gets a literal instruction instead.
+      if [ "$1" = copilot ]; then orch_body '' ''; else sed '1,2d' "$src"; fi
+    } > "$cdir/$name$cext"
+  done
+
+  # A pack-scoped model needs its own agent file to live in. Only the pack
+  # overrides have one; `coder` is a single file shared by the 4- and 6-pack.
+  awk '$1=="model" && $2 ~ /\./ { print $2 }' "$CONF" | while read -r k; do
+    [ -f "$DIR/roles/${k#*.}.${k%%.*}.md" ] ||
+      printf 'swarm: note - "model %s" applies to `swarm run %s` only; the installed %s agent uses "model %s".\n' \
+        "$k" "${k%%.*}" "${k#*.}" "${k#*.}" >&2
+  done
+
+  printf 'swarm: %s role subagents -> %s/\n' "$(ls "$DIR"/roles/*.md | wc -l | tr -d ' ')" "$adir"
+  printf 'swarm: commands (%s) -> %s/\n' "$variants" "$cdir"
+  echo   'swarm: generated - edit swarmforge/roles/ and commands/, then re-run install.'
+  [ "$1" = codex ] && echo 'swarm: note - codex reads prompts from ~/.codex/prompts, not the project. Copy .codex/prompts/ there.'
+  [ "$1" = agy ] && echo 'swarm: note - the agy command directory is unverified. Check `agy inspect` and move .agents/commands/ if wrong.'
+  [ "$1" = copilot ] && cat <<'EOF'
+swarm: note - copilot has no custom slash commands; GitHub closed copilot-cli#618
+swarm:        pointing at skills instead. The orchestrator is a skill, invoked by
+swarm:        name. Either of these works:
+swarm:
+swarm:          swarm start copilot 6 "add a login flow"
+swarm:          copilot -p 'use the swarm skill: 6-pack, add a login flow'
+swarm:
+swarm: note - copilot agent frontmatter has no model field. Per-role models apply
+swarm:        only via `swarm run`.
+EOF
+  return 0
+}
+
+# One session orchestrates, role subagents do the work. For hosts that cannot
+# expand a command file, this is the equivalent of typing /swarm <pack> <task>.
+cmd_start() {
+  [ $# -ge 3 ] || die 'usage: swarm start <cli> <pack> "<task>"'
+  cli=$1; pack=$2; shift 2; task=$*
+  [ -n "$(chain_of "$pack")" ] || die "no pack '$pack' in packs.conf"
+  command -v "$cli" >/dev/null 2>&1 || die "$cli is not installed"
+  mkdir -p docs/handoffs
+  [ -f docs/handoffs/.gitignore ] || echo '*' > docs/handoffs/.gitignore
+  # The orchestrator has to ask the user where to run and whether to use a
+  # worktree before it spawns anyone, so it needs the terminal just like an
+  # interactive role does.
+  ia=''
+  if can_tty "$cli" 'the orchestrator'; then ia=1; fi
+  run_cli "$cli" '' "$(orch_body "$pack" "$task")" "$ia"
+}
+
+# The orchestrator variants have no pid a shell can watch, so they claim and
+# release the tree by hand. Without this the check in their command files reads
+# a file nothing ever writes.
+cmd_lock() {
+  [ $# -ge 1 ] || die 'usage: swarm lock "<task>"'
+  mkdir -p docs/handoffs
+  [ -f docs/handoffs/.gitignore ] || echo '*' > docs/handoffs/.gitignore
+  if h=$(lock_holder); then
+    die "another swarm already owns this working tree ($h).
+       Give this one its own:  d=\$($0 worktree \"$*\") && cd \"\$d\"
+       If that swarm is gone, release the tree with: $0 unlock"
+  fi
+  printf -- '- %s\n' "$(slug "$*")" > "$LOCK"
+  say "swarm: this working tree is claimed. Release it with: $0 unlock"
+}
+
+cmd_unlock() { rm -f "$LOCK"; say 'swarm: working tree released.'; }
+
+# worktree <name> -- a working tree of its own, so several swarms can run at
+# once. Plain `git worktree add`; it lives here only so the orchestrator has one
+# command to run, and so the branch and directory are named from the task.
+# Prints the path on stdout and nothing else.
+cmd_worktree() {
+  [ $# -ge 1 ] || die 'usage: swarm worktree "<task or name>"'
+  n=$(slug "$*")
+  [ -n "$n" ] || die 'that name has no usable characters'
+  d="../$n"
+  if [ -e "$d" ]; then die "$d already exists"; fi
+  git rev-parse --git-dir >/dev/null 2>&1 || die 'not a git repository'
+  git worktree add -b "$n" "$d" >&2 || die "could not create a worktree at $d"
+  printf '%s\n' "$d"
+}
+
+cmd_check() {
+  [ $# -ge 1 ] || die 'usage: swarm check <role> [report-path]'
+  check_role "$@" || exit 1
+}
+
+# check-hook -- for Claude Code's SubagentStop and TeammateIdle hooks. Exit 2 is
+# what Claude Code reads as "do not stop yet"; the message goes back to the role.
+#
+# These hooks fire for EVERY subagent, not only ours, so anything that is not a
+# swarm role must exit 0 and get out of the way.
+cmd_check_hook() {
+  # ponytail: sed, not jq - jq may not be installed. This breaks only on an
+  # escaped quote inside a value, which neither a role name nor a path here can
+  # contain. Newlines go, spaces stay: a cwd may have spaces in it.
+  p=$(tr -d '\n')
+  role=$(printf '%s' "$p" | jfield agent_type)
+  [ -n "$role" ] || exit 0
+  # Strip only the 2-pack suffix. Cutting at the first hyphen would match any
+  # subagent whose name starts with a role word -- coder-reviewer, QA-helper --
+  # and block an agent that has nothing to do with this swarm from stopping.
+  [ -f "$DIR/roles/${role%-2pack}.md" ] || exit 0      # not one of ours
+  # The hook runs from the directory the session started in, but an orchestrator
+  # is told to cd into a worktree before the first role. Check the tree the role
+  # actually worked in, not the one this process happens to start in.
+  d=$(printf '%s' "$p" | jfield cwd)
+  if [ -n "$d" ] && [ -d "$d" ]; then cd "$d"; fi
+  check_role "$role" || exit 2
+  exit 0
+}
+
+# next -- the first role in the chain with no finished report. For an
+# orchestrator that restarted and should not redo work already done.
+cmd_next() {
+  [ $# -ge 2 ] || die 'usage: swarm next <pack> "<task>"'
+  pack=$1; shift; task=$*
+  chain=$(chain_of "$pack")
+  [ -n "$chain" ] || die "no pack '$pack' in packs.conf"
+  name=$(slug "$task")
+  for role in $chain; do
+    if ! report_ok "docs/handoffs/$name-$role.md"; then printf '%s\n' "$role"; return 0; fi
+  done
+  echo done
+}
+
+cmd_show() {
+  [ $# -eq 1 ] || die 'usage: swarm show <pack>'
+  chain=$(chain_of "$1") || true
+  [ -n "$chain" ] || die "no pack '$1' in packs.conf"
+  for role in $chain; do
+    be=$(backend_of "$role") || be=''
+    mdl=$(model_of "$role" "$1")
+    printf '%-10s %-9s %-12s %-13s %s\n' "$role" "${be:-claude}" "${mdl:-(default)}" \
+      "$([ -n "$(conf_inter "$role")" ] && echo interactive)" "$(desc_of "$(role_file "$role" "$1")")"
+  done
+}
+
+case ${1:-} in
+  run)     shift; cmd_run '' "$@" ;;
+  resume)  shift; cmd_run 1  "$@" ;;
+  start)   shift; cmd_start "$@" ;;
+  lock)    shift; cmd_lock "$@" ;;
+  unlock)  shift; cmd_unlock "$@" ;;
+  install) shift; cmd_install "$@" ;;
+  show)    shift; cmd_show "$@" ;;
+  worktree) shift; cmd_worktree "$@" ;;
+  check)   shift; cmd_check "$@" ;;
+  check-hook) shift; cmd_check_hook "$@" ;;
+  next)    shift; cmd_next "$@" ;;
+  *) cat >&2 <<'EOF'
+usage:
+  swarm run <2|4|6> "<task>"        run the chain, one CLI call per role
+  swarm resume <2|4|6> "<task>"     the same, skipping roles that already
+                                    finished; use after a failed run
+  swarm start <cli> <2|4|6> "<task>"
+                                    one session orchestrates, roles as subagents
+  swarm install <claude|opencode|agy|codex|copilot>
+                                    generate that CLI's native subagent files
+  swarm show <2|4|6>                list the chain and its backends
+  swarm worktree "<task>"           a working tree of its own; prints its path
+  swarm check <role> [report]       did that role commit and leave a report?
+  swarm next <2|4|6> "<task>"       first role in the chain not yet finished
+  swarm lock "<task>"               claim this working tree for one swarm
+  swarm unlock                      release it
+
+Edit packs.conf to change chains or assign a role to a different CLI.
+EOF
+     exit 1 ;;
+esac
