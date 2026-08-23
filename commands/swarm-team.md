@@ -140,6 +140,12 @@ with that path and one sentence.
 If a teammate sends you a long report instead of a path, tell it once to write
 the file and send the path.
 
+A role that finds something wrong or missing may send the work back to the
+**earlier** role that owns the fix, instead of forward to the next one. It
+messages that role directly and tells you. Create the extra tasks for the repeat
+pass, in chain order, from that role forward. If the same pair sends work back
+and forth more than three times, stop and tell the user.
+
 ## Failure
 
 If a role fails or its verification does not pass, stop the chain. Do not let a

@@ -131,6 +131,21 @@ for the role after you. There are no handoff scripts.
    previous report when it has them. Omit a line only if your role runs no such
    command; the specifier runs neither.
 
+   **Sending work back.** If what you found must be fixed by an *earlier* role —
+   the work is wrong or missing, not merely improvable — add one more header
+   line naming that role:
+
+   ```text
+   next:   coder
+   ```
+
+   The chain then resumes at that role and flows forward through you again. Say
+   the same thing in your one-sentence message, because some hosts read the
+   message and not the file. Name an **earlier** role in your own chain: never
+   yourself, and never a later one — this is not a way to skip a role. Leave the
+   line out of every ordinary handoff. Findings the next role can act on are not
+   a reason to send work back — write them in the report and hand off normally.
+
    Then say, tersely: what state the work is in, what changed, and what the next
    role must check. No process narrative, no list of what you verified.
 4. Tell the next role the report **path**, in one sentence. **Never paste the

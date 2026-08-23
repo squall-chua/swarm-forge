@@ -16,9 +16,22 @@ LOG=''   # set by cmd_run; say() copies the run banner there as well as stderr.
 say() { printf '%s\n' "$*" >&2; [ -n "$LOG" ] && printf '%s\n' "$*" >> "$LOG"; return 0; }
 die() { say "swarm: $*"; exit 1; }
 
-chain_of()   { awk -v p="$1" '$1=="pack" && $2==p { $1=""; $2=""; print }' "$CONF"; }
+# Blanking $1 and $2 leaves their field separators behind, so strip them: the
+# chain is read a word at a time and a leading space would look like a role.
+chain_of()   { awk -v p="$1" '$1=="pack" && $2==p { $1=""; $2=""; sub(/^ +/, ""); print }' "$CONF"; }
 backend_of() { awk -v r="$1" '$1=="backend" && $2==r { print $3; exit }' "$CONF"; }
 conf_inter()  { awk -v r="$1" '$1=="interactive" && $2==r { print 1; exit }' "$CONF"; }
+
+# chain_from <role> <chain> -- the chain from that role onward; empty when the
+# role is not in it. A role that sends work back names a role, not a position.
+chain_from() {
+  out=''
+  for r in $2; do
+    if [ -z "$out" ] && [ "$r" != "$1" ]; then continue; fi
+    out="${out:+$out }$r"
+  done
+  printf '%s\n' "$out"
+}
 
 # One swarm per working tree. Two in the same tree see each other's in-flight
 # files as their own uncommitted changes and both die at the first role, with an
@@ -185,6 +198,12 @@ prompt_for() {
 
 report_commit() { sed -n 's/^commit: *//p' "$1" 2>/dev/null | head -1; }
 
+# report_next <report-path> -- the role this report sends the work back to, if
+# any. One optional header line; almost every handoff omits it. The header is
+# the top of the file, and the search stops there: the body below is prose, and
+# a sentence starting "next: coder" must not cost two more CLI calls.
+report_next()   { sed -n '1,10s/^next: *//p' "$1" 2>/dev/null | head -1; }
+
 # report_ok <report-path> -- a report counts as finished only when it names a
 # commit that HEAD still stands on. A half-written file must not be skipped on
 # resume, and neither must a role whose work was thrown away: after a
@@ -240,6 +259,36 @@ check_role() {
   return 1
 }
 
+# take_next <role> <report> -- honour a `next: <role>` line by rewinding the
+# chain to that role. Reads and sets cmd_run's $chain, $pending, $jumps and
+# $res, and leaves them alone when the report asks for nothing.
+take_next() {
+  nx=$(report_next "$2")
+  [ -n "$nx" ] || return 0
+  # Backward only. A forward jump would let a role skip the gate that follows
+  # it. The tail from `nx` holds this role exactly when `nx` comes first, and
+  # holds nothing at all when `nx` is not a role in this chain.
+  back=$(chain_from "$nx" "$chain")
+  ok=''
+  if [ "$nx" != "$1" ]; then
+    case " $back " in *" $1 "*) ok=1 ;; esac
+  fi
+  if [ -z "$ok" ]; then
+    say "swarm: ignoring 'next: $nx' from '$1' - not an earlier role in this chain."
+    return 0
+  fi
+  jumps=$((jumps + 1))
+  [ "$jumps" -le "$maxjump" ] ||
+    die "the chain was sent back $maxjump times without finishing. $fix"
+  # A jump makes the resume skip wrong: the roles it would skip are the ones
+  # being asked to work again, and their old reports still name commits HEAD
+  # stands on. Resume was for a crash; from here on, run every role.
+  res=''
+  say ''
+  say "=== $(date '+%T') $1 sends the work back to $nx ==="
+  pending=$back
+}
+
 # cmd_run <resume-flag> <pack> <task...>
 # There is no daemon and no queue, so the two things that actually break a chain
 # are checked here instead: work left uncommitted, and a report naming no commit.
@@ -274,12 +323,28 @@ cmd_run() {
   fix="Fix it, then: swarm resume $pack \"$task\""
   say ''
   say "=== $(date '+%F %T')  ${res:+resuming }$pack-pack: $task ==="
+  # The chain is a list of roles left to visit, not a fixed march. A role that
+  # finds work belonging to an earlier role writes `next: <role>` in its report,
+  # and the chain resumes from there, flowing forward through the later roles
+  # again. Upstream squad does this with review verdicts and a state machine;
+  # here it is one header line.
+  # ponytail: a jump cap, not cycle detection. Two roles that disagree would run
+  # forever, and every pass is a paid CLI call.
+  maxjump=10
+  jumps=0
   prev=''
-  for role in $chain; do
+  pending=$chain
+  while [ -n "$pending" ]; do
+    role=${pending%% *}
+    rest=${pending#"$role"}; rest=${rest# }
     rp="docs/handoffs/$name-$role.md"
+    # A skipped role's report is read for a jump just the same. Resume skips
+    # every role that finished, and the role that asked for the jump is one of
+    # them, so ignoring it here would walk straight past the work it asked for
+    # and call the chain complete.
     if [ -n "$res" ] && report_ok "$rp"; then
       say "=== $(date '+%T') $role - done already, skipped ==="
-      prev=$rp; continue
+      prev=$rp; pending=$rest; take_next "$role" "$rp"; continue
     fi
     be=$(backend_of "$role") || be=''
     [ -n "$be" ] || be=claude
@@ -297,6 +362,8 @@ cmd_run() {
       || die "role '$role' failed; chain stopped. $fix"
     check_role "$role" "$rp" || die "chain stopped after '$role'. $fix"
     prev=$rp
+    pending=$rest
+    take_next "$role" "$rp"
   done
   say ''
   say "=== $(date '+%T') chain complete: $name ==="
@@ -554,7 +621,7 @@ cmd_status() {
   stale=''
   for n in $names; do
     printf '\n%s\n' "$n"
-    nxt=1
+    nxt=1; sback=''
     for role in $chain; do
       rp=$(report_path "$n" "$role") || rp=''
       if   [ -z "$rp" ];    then st='-'
@@ -564,12 +631,23 @@ cmd_status() {
       if [ "$st" != done ] && [ -n "$nxt" ]; then mark='  <-- next'; nxt=''
       else                                        mark=''
       fi
+      # A finished report still asking for an earlier role means the loop it
+      # asked for has not run yet. Every jump ends with this role writing its
+      # report again, so a `next:` line left standing is work still owed.
+      if [ "$st" = done ]; then
+        nx=$(report_next "$rp")
+        if [ -n "$nx" ]; then mark="$mark  sent back to $nx"; sback=1; fi
+      fi
       # Pad only when a marker follows, so no line ends in spaces.
       if [ -n "$mark" ]; then printf '  %-10s %-5s%s\n' "$role" "$st" "$mark"
       else                    printf '  %-10s %s\n'     "$role" "$st"
       fi
     done
-    if [ -n "$nxt" ]; then printf '  chain complete\n'; fi
+    if [ -n "$nxt" ]; then
+      if [ -n "$sback" ]; then printf '  every role done, but one sent work back - not finished\n'
+      else                     printf '  chain complete\n'
+      fi
+    fi
   done
   if [ -n "$stale" ]; then
     printf '\nstale: a report naming no commit HEAD stands on. Its work is not in\n'

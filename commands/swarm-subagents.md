@@ -136,7 +136,15 @@ Then, for each role in the chain **in order**:
    chain: work left uncommitted, and no report naming the commit the chain is now
    on. If it exits non-zero, print its message to that role, have it fix the
    problem, and check again. Do not invoke the next role until it passes.
-5. Move to the next role.
+5. Move to the next role — unless the role's reply names an **earlier** role that
+   must fix what it found. Then invoke that role instead, and carry on forward
+   from there, through the roles that already ran. Tell that role the report path
+   it must read, nothing more.
+
+A role may only send the work back for something wrong or missing, not for
+findings the next role can act on. If the same pair sends work back and forth
+more than three times, stop and tell the user; they are disagreeing, not
+converging.
 
 If your session restarted part-way through a run, ask where to pick up rather
 than redoing finished work:

@@ -145,6 +145,44 @@ backwards, but recipients merge, verify, and stop — they do not forward it and
 do not start new work from it. Upstream calls this the terminal broadcast, and
 it is the one place the "always hand off" rule does not apply.
 
+### Sending work back
+
+A role that finds something **wrong or missing** — work the next role cannot
+act on, because it belongs to an earlier role — adds one line to its report
+header:
+
+```text
+next:   coder
+```
+
+The chain resumes at that role and flows forward again through the roles that
+already ran, so a fix is reviewed a second time. This is upstream squad's
+`changes-requested` verdict, minus the state machine.
+
+The jump is backward only. `swarm run` ignores a `next:` naming the role itself,
+a later role, or a role outside the chain, and says so — a role cannot use this
+to skip the gate that follows it. Findings the next role can act on go in the
+report, and the chain steps on as usual.
+
+`swarm run` stops the chain after ten jumps. Two roles that disagree would
+otherwise run forever, and every pass is a paid CLI call. Both orchestrator
+variants read the same intent off the role's one-sentence message instead of the
+file, and are told to stop after three round trips.
+
+The line is read from the top of the report only, so a sentence in the body that
+happens to start `next:` costs nothing. `swarm resume` reads it too, off the
+report of a role it skipped as finished, so a run that died just after a jump
+still does the work that was asked for, and `swarm status` marks the report that
+asked. Both are under "Seeing where a chain got to".
+
+This is also what makes the 2-pack loop real in `swarm run`: the 2-pack cleaner
+writes `next: coder` when cleanup exposes missing behavior, and nothing at all
+when the task is done.
+
+`./test-swarm.sh` checks the jump end to end: it runs the real `swarm` over a
+throwaway git repo with a stub agent CLI, and fails if the chain marches
+straight on.
+
 ## A model per role
 
 `packs.conf` sets the model each role uses:
@@ -265,6 +303,22 @@ add-a-login-flow
 | `done` | the report names a commit HEAD still stands on |
 | `stale` | a report is there, but names no such commit. Half-written, or its work was thrown away by a reset. `swarm resume` reruns that role |
 | `-` | no report |
+| `sent back to <role>` | that report asks for an earlier role to run again, and the loop it asked for has not finished. See "Sending work back" |
+
+A chain whose roles are all `done` normally ends with `chain complete`. When one
+of those reports asks for an earlier role, it says `every role done, but one
+sent work back - not finished` instead, because it is not finished:
+
+```text
+add-a-login-flow
+  specifier  done
+  coder      done
+  cleaner    done   sent back to coder
+  architect  done
+  hardener   done
+  QA         done
+  every role done, but one sent work back - not finished
+```
 
 **It reads disk, not the orchestrator.** That is the point. In the team variant
 reports never pass through your window, and the `TeammateIdle` hook can silently
@@ -385,6 +439,10 @@ Two reports do not count as finished. A half-written one, with no commit line.
 And one whose commit is no longer in the branch: if you recover from a bad run
 with `git reset --hard`, the abandoned commits still resolve, but the work is
 gone, so those roles run again rather than the chain building on a hole.
+
+A skipped role's report is still read for a `next:` line, so a run that died
+just after a role sent work back resumes doing that work rather than walking
+past it. See "Sending work back".
 
 ### The same check in the other two variants
 
@@ -567,6 +625,7 @@ feature.
 | `inbox/`, `outbox/`, priorities, batch mode | nothing — a one-shot role is never busy, so there is no queue to order |
 | `dequeued_at` / `completed_at` audit headers | `git log`, plus `docs/handoffs/<task>.log` for failures |
 | `ready_for_next.sh` after a crash | `swarm resume <pack> "<task>"` |
+| squad's `changes-requested` review verdict | a `next: <role>` line in the report |
 | Per-role git worktrees | One shared working tree |
 | tmux windows, terminal adapters, watchdog | The CLI's own agent view |
 | `./swarm` launcher | `/swarm <pack>` |
@@ -626,6 +685,11 @@ verify once, and stop.
 - **A failed role is not resumable mid-role, only mid-chain.** `swarm resume`
   restarts the failed role from the top. Upstream's inbox keeps a task in
   `in_process` across a crash; here a role either finished or it did not.
+- **A `next:` jump is honoured on resume, but the role that asked for it runs
+  again.** The line lives in the report, so `swarm resume` finds it — but the
+  role that wrote it is skipped as finished before the jump is read, and after
+  the jump every role runs, including the one that was already redone. Expect
+  one wasted pass on the role that was being sent work.
 - **Codex prompts are not project-scoped.** Codex reads `~/.codex/prompts/`.
   Copy `.codex/prompts/` there after install.
 - **Copilot CLI has no custom slash commands, by decision.** The orchestrator is

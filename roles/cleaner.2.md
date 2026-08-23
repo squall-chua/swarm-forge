@@ -40,5 +40,6 @@ from the constitution and make them ready for immediate use.
 
 - Run unit tests and relevant local verification.
 - The 2-pack is a loop, not a straight chain. When cleanup exposes missing or
-  wrong behavior, hand back to the **coder** with what you found. Otherwise the
-  task is done — report to the orchestrator and stop.
+  wrong behavior, hand back to the **coder** with what you found: add a
+  `next: coder` line to your report header, and say so in your message.
+  Otherwise the task is done — report to the orchestrator and stop.
