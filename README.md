@@ -238,6 +238,50 @@ Any CLI can run the chain without a subagent system at all:
 ./swarm show 6                        # print the chain, backends, and models
 ```
 
+## Seeing where a chain got to
+
+`swarm status` prints the chain and marks each role, reading the report files
+and nothing else:
+
+```sh
+./swarm status 6                      # every task it finds in docs/handoffs/
+./swarm status 6 "add a login flow"   # just that one
+```
+
+```text
+tree claimed (holder -, task add-a-login-flow)
+
+add-a-login-flow
+  specifier  done
+  coder      done
+  cleaner    stale  <-- next
+  architect  -
+  hardener   -
+  QA         -
+```
+
+| Mark | Meaning |
+|---|---|
+| `done` | the report names a commit HEAD still stands on |
+| `stale` | a report is there, but names no such commit. Half-written, or its work was thrown away by a reset. `swarm resume` reruns that role |
+| `-` | no report |
+
+**It reads disk, not the orchestrator.** That is the point. In the team variant
+reports never pass through your window, and the `TeammateIdle` hook can silently
+do nothing if the payload carries no `agent_type` (see "What this port does not
+do"). A teammate that goes idle without committing leaves no report, and this is
+what shows you.
+
+Two things to know:
+
+- **You give the pack, so every task is drawn against that chain.** A task run as
+  a 2-pack, listed under `swarm status 6`, shows `specifier` as missing. Nothing
+  records which pack a past task used.
+- **With no task name it finds names by stripping role suffixes off the report
+  filenames.** `swarm run` slugs its name from the task text, but the team
+  orchestrator invents its own and never writes it to the lock, so there is
+  nothing else to read it from.
+
 ### How a role knows its pack
 
 Several role files carry a section that applies only when another role is

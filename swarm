@@ -504,6 +504,79 @@ cmd_next() {
   echo done
 }
 
+# report_path <task> <role> -- that role's report, under its plain name or under
+# the installed 2-pack agent's (coder-2pack). Prints nothing if neither is there.
+report_path() {
+  for p in "docs/handoffs/$1-$2.md" "docs/handoffs/$1-$2-2pack.md"; do
+    if [ -f "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# task_names <chain> -- every task name under docs/handoffs/, recovered by
+# stripping a role suffix off each report file. `swarm run` slugs its name from
+# the task text, but the team orchestrator invents its own and never puts it in
+# the lock, so reading the files back is the only way to learn what ran.
+task_names() {
+  for role in $1; do
+    for f in docs/handoffs/*-"$role".md docs/handoffs/*-"$role"-2pack.md; do
+      [ -f "$f" ] || continue
+      b=${f##*/}; b=${b%.md}; b=${b%-2pack}
+      printf '%s\n' "${b%-$role}"
+    done
+  done | sort -u
+}
+
+# cmd_status <pack> ["<task>"] -- chain state, read off disk and nothing else.
+#
+# The team variant never passes reports through your window, and its
+# TeammateIdle hook may silently do nothing if the payload has no agent_type
+# (see README, "What this port does not do"). So this is the one view that does
+# not take the orchestrator's word for what is finished.
+#
+# done  - report names a commit HEAD still stands on
+# stale - a report is there but names no such commit: half-written, or its work
+#         was thrown away by a reset, which `swarm resume` would skip right over
+# -     - no report
+cmd_status() {
+  [ $# -ge 1 ] || die 'usage: swarm status <2|4|6> ["<task>"]'
+  pack=$1; shift
+  chain=$(chain_of "$pack")
+  [ -n "$chain" ] || die "no pack '$pack' in packs.conf"
+
+  if h=$(lock_holder); then printf 'tree claimed (%s)\n' "$h"
+  else                      printf 'tree free\n'
+  fi
+
+  if [ $# -ge 1 ]; then names=$(slug "$*"); else names=$(task_names "$chain"); fi
+  if [ -z "$names" ]; then printf 'no task reports in docs/handoffs/\n'; return 0; fi
+
+  stale=''
+  for n in $names; do
+    printf '\n%s\n' "$n"
+    nxt=1
+    for role in $chain; do
+      rp=$(report_path "$n" "$role") || rp=''
+      if   [ -z "$rp" ];    then st='-'
+      elif report_ok "$rp"; then st=done
+      else                       st=stale; stale=1
+      fi
+      if [ "$st" != done ] && [ -n "$nxt" ]; then mark='  <-- next'; nxt=''
+      else                                        mark=''
+      fi
+      # Pad only when a marker follows, so no line ends in spaces.
+      if [ -n "$mark" ]; then printf '  %-10s %-5s%s\n' "$role" "$st" "$mark"
+      else                    printf '  %-10s %s\n'     "$role" "$st"
+      fi
+    done
+    if [ -n "$nxt" ]; then printf '  chain complete\n'; fi
+  done
+  if [ -n "$stale" ]; then
+    printf '\nstale: a report naming no commit HEAD stands on. Its work is not in\n'
+    printf 'the tree, and `swarm resume` will rerun that role.\n'
+  fi
+}
+
 cmd_show() {
   [ $# -eq 1 ] || die 'usage: swarm show <pack>'
   chain=$(chain_of "$1") || true
@@ -528,6 +601,7 @@ case ${1:-} in
   check)   shift; cmd_check "$@" ;;
   check-hook) shift; cmd_check_hook "$@" ;;
   next)    shift; cmd_next "$@" ;;
+  status)  shift; cmd_status "$@" ;;
   *) cat >&2 <<'EOF'
 usage:
   swarm run <2|4|6> "<task>"        run the chain, one CLI call per role
@@ -541,6 +615,9 @@ usage:
   swarm worktree "<task>"           a working tree of its own; prints its path
   swarm check <role> [report]       did that role commit and leave a report?
   swarm next <2|4|6> "<task>"       first role in the chain not yet finished
+  swarm status <2|4|6> ["<task>"]   chain state read off disk: which roles are
+                                    done, which is next. No task = every task
+                                    it finds in docs/handoffs/
   swarm lock "<task>"               claim this working tree for one swarm
   swarm unlock                      release it
 
