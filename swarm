@@ -102,20 +102,29 @@ run_cli() {
     "$be" "$@"
     return
   fi
+  # Roles run headless: there is no terminal to approve a tool call on, so
+  # without a bypass flag every Write, Edit, and Bash call is denied and no role
+  # can commit. Upstream swarm-forge does the same, with --yolo on every role
+  # line in swarmforge.conf. The interactive role is left alone: it owns the
+  # terminal and the user can answer it.
+  # opencode and agy carry no flag - theirs is unverified. Add it here if a role
+  # on one of them stalls on approvals.
   if [ -n "$mdl" ]; then
     case "$be" in
-      claude)   set -- --model "$mdl" -p "$prompt" ;;
-      codex)    set -- exec -m "$mdl" "$prompt" ;;
+      claude)   set -- --permission-mode bypassPermissions --model "$mdl" -p "$prompt" ;;
+      codex)    set -- exec --yolo -m "$mdl" "$prompt" ;;
       opencode) set -- run  -m "$mdl" "$prompt" ;;
       agy)      set -- --model "$mdl" -p "$prompt" ;;
-      copilot)  set -- --model "$mdl" -p "$prompt" ;;
+      copilot)  set -- --allow-all --model "$mdl" -p "$prompt" ;;
       *) die "unknown backend '$be'. Add it to run_cli() in $0." ;;
     esac
   else
     case "$be" in
-      claude|agy|copilot) set -- -p "$prompt" ;;
-      codex)              set -- exec "$prompt" ;;
-      opencode)           set -- run "$prompt" ;;
+      claude)   set -- --permission-mode bypassPermissions -p "$prompt" ;;
+      copilot)  set -- --allow-all -p "$prompt" ;;
+      agy)      set -- -p "$prompt" ;;
+      codex)    set -- exec --yolo "$prompt" ;;
+      opencode) set -- run "$prompt" ;;
       *) die "unknown backend '$be'. Add it to run_cli() in $0." ;;
     esac
   fi

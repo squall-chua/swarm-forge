@@ -256,6 +256,28 @@ yourself to `packs.conf` works the same way without any role file mentioning it
 by name. The two orchestrator variants pass the same fact as a pack adjustment
 in the spawn prompt.
 
+### Headless roles bypass tool approval
+
+A headless role has no terminal, so nothing can answer a permission prompt. Left
+alone it would be denied every `Write`, `Edit`, and `Bash` call and could never
+commit. `run_cli()` therefore passes each backend its bypass flag:
+
+| Backend | Flag |
+|---|---|
+| `claude` | `--permission-mode bypassPermissions` |
+| `codex` | `--yolo` |
+| `copilot` | `--allow-all` |
+| `opencode`, `agy` | none — their flag is unverified. Add it in `run_cli()` if a role stalls. |
+
+Upstream swarm-forge does the same, with `--yolo` on every role line in its
+`swarmforge.conf`.
+
+The interactive role is left alone. It owns the terminal, so you approve its
+calls yourself.
+
+This means a role can run any command in the working tree without asking. Run a
+chain on code you trust, or give it a worktree of its own (`swarm worktree`).
+
 ### The interactive role
 
 Most roles run headless — one CLI call, no way to ask you anything. The
