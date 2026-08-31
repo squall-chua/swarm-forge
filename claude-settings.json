@@ -7,14 +7,7 @@
     "SubagentStop": [
       {
         "hooks": [
-          { "type": "command", "command": "/path/to/swarmforge/swarm check-hook" }
-        ]
-      }
-    ],
-    "TeammateIdle": [
-      {
-        "hooks": [
-          { "type": "command", "command": "/path/to/swarmforge/swarm check-hook" }
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/swarmforge/swarm check-hook" }
         ]
       }
     ]

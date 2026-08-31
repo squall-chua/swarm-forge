@@ -35,7 +35,8 @@ cd /path/to/your/project
 /path/to/swarmforge/swarm install claude      # or opencode | agy | codex | copilot
 ```
 
-That writes the six role subagents and the command(s) into the right places:
+That copies the toolkit into `<project>/swarmforge/` and writes the six role
+subagents and the command(s) into the right places:
 
 | CLI | Roles | Commands |
 | --- | --- | --- |
@@ -45,16 +46,24 @@ That writes the six role subagents and the command(s) into the right places:
 | Codex | `.codex/agents/*.toml` | `.codex/prompts/swarm.md` |
 | Copilot | `.github/agents/*.agent.md` | `.github/skills/swarm/SKILL.md` |
 
+The copy under `swarmforge/` is what the generated commands call
+(`swarmforge/swarm check`, `swarmforge/swarm lock`, and so on), so the project
+does not depend on where you installed from. Commit it if you use worktrees — a
+new worktree only has files git knows about.
+
 There is nothing to configure. The roles read the project's languages, test
 command, and verification command off the project itself, and each role records
 the two commands in its handoff report so the whole chain runs the same ones.
 
 Then:
 
-1. On Claude Code, merge `claude-settings.json` into `.claude/settings.json` and
-   replace `/path/to/swarmforge` with your own path. It carries the agent-teams
-   flag, which the team variant needs, and the two hooks that check a role
-   actually committed before it finishes.
+1. On Claude Code, install writes `.claude/settings.json` for you. If there is
+   already one, it merges into it with `jq`, keeping every setting and hook the
+   project already has, and saves the old file as `.claude/settings.json.bak`.
+   Re-installing does not add the hook twice. Without `jq` it leaves your file
+   alone and tells you to merge `swarmforge/claude-settings.json` by hand.
+   What it adds: the agent-teams flag, which the team variant needs, and the
+   `SubagentStop` hook that checks a role actually committed before it finishes.
 2. Run `/swarm 6 add a login flow`.
 
 Generated files are disposable. Edit `roles/`, `commands/`, and
@@ -321,10 +330,9 @@ add-a-login-flow
 ```
 
 **It reads disk, not the orchestrator.** That is the point. In the team variant
-reports never pass through your window, and the `TeammateIdle` hook can silently
-do nothing if the payload carries no `agent_type` (see "What this port does not
-do"). A teammate that goes idle without committing leaves no report, and this is
-what shows you.
+reports never pass through your window, and there is no hook on that side (see
+"Known gaps"). A teammate that goes idle without committing leaves no report,
+and this is what shows you.
 
 Two things to know:
 
@@ -459,13 +467,15 @@ When a role finishes, `HEAD` is its commit. A role that never committed leaves
 that had nothing to commit still passes, because its report names the commit it
 verified, which is `HEAD` unchanged.
 
-**Claude Code enforces it with a hook.** Both entries are in
-`claude-settings.json`; change `/path/to/swarmforge` to your own path:
+**The Claude Code subagent variant enforces it with a hook.** The entry is in
+`claude-settings.json` and install puts it in `.claude/settings.json`. It runs
+the project's own copy, `$CLAUDE_PROJECT_DIR/swarmforge/swarm check-hook`, so
+the settings file holds no machine-specific path and can be committed:
 
 | Variant | Hook | What exit 2 does |
 | --- | --- | --- |
 | Subagent | `SubagentStop` | the role cannot finish; it is pushed back to fix its own commit |
-| Team | `TeammateIdle` | the teammate cannot go idle |
+| Team | none | nothing gates a teammate; use `swarm status` |
 
 `swarm check-hook` reads the role name from the hook's JSON. It fires for **every**
 subagent, not only ours, so anything that is not a swarm role exits 0 straight
@@ -672,14 +682,12 @@ verify once, and stop.
   have; getting them back means getting the daemon, the queue and the merges back
   too. Parallelism between whole swarms is a different thing and it works — see
   "Running several swarms at once".
-- **`TeammateIdle`'s payload field is unverified.** `swarm check-hook` reads the
-  role from `agent_type`. The hooks reference documents `agent_type` as a common
-  input field for **subagents**, so `SubagentStop` is sound. Whether a
-  `TeammateIdle` payload carries the same field is a guess. If the team-variant
-  hook never fires, that is the first thing to check — and note the hook exits 0
-  when it finds no role name, so a wrong guess makes it silently do nothing
-  rather than block anything.
-- **The other four CLIs have no equivalent hook.** There `swarm check` is an
+- **The team variant has no hook.** `TeammateIdle` was tried and dropped. Its
+  payload is `teammate_name` and `team_name` — no `agent_type`, which is the
+  field `swarm check-hook` reads — so it did nothing in practice. Only
+  `SubagentStop` is installed. On the team side use `swarm status` to see which
+  roles really finished.
+- **The other four CLIs have no hook either.** There `swarm check` is an
   instruction to the orchestrator, not a gate. See "The same check in the other
   two variants".
 - **A failed role is not resumable mid-role, only mid-chain.** `swarm resume`

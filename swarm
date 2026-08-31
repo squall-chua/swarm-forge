@@ -369,6 +369,39 @@ cmd_run() {
   say "=== $(date '+%T') chain complete: $name ==="
 }
 
+# install_settings <toolkit-dir> -- put the SubagentStop hook and the agent-teams
+# flag into .claude/settings.json. No settings there yet: copy ours in. Already
+# one: merge with jq, keeping every setting and hook the project already has.
+# Dropping our own old entry first makes a re-install idempotent.
+install_settings() {
+  if [ ! -f .claude/settings.json ]; then
+    cp "$1/claude-settings.json" .claude/settings.json
+    echo 'swarm: settings -> .claude/settings.json'
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    printf 'swarm: note - .claude/settings.json is already there and jq is not installed.\n'
+    printf 'swarm:        Merge %s/claude-settings.json into it yourself.\n' "$1"
+    return 0
+  fi
+  jq -s '.[0] as $cur | .[1] as $new | $cur
+    | .env = ((.env // {}) + $new.env)
+    | .teammateMode = (.teammateMode // $new.teammateMode)
+    | .hooks = (.hooks // {})
+    | .hooks.SubagentStop = ((((.hooks.SubagentStop // [])
+        | map(select((.hooks // []) | map(.command // "")
+                     | any(test("swarm check-hook")) | not)))
+        + $new.hooks.SubagentStop))
+    ' .claude/settings.json "$1/claude-settings.json" > "$1/.settings.merged" || {
+      printf 'swarm: note - could not merge .claude/settings.json (is it valid JSON?).\n'
+      printf 'swarm:        Merge %s/claude-settings.json into it yourself.\n' "$1"
+      rm -f "$1/.settings.merged"; return 0
+    }
+  cp .claude/settings.json .claude/settings.json.bak
+  mv "$1/.settings.merged" .claude/settings.json
+  echo 'swarm: settings -> merged into .claude/settings.json (old one kept as .claude/settings.json.bak)'
+}
+
 cmd_install() {
   [ $# -eq 1 ] || die 'usage: swarm install <claude|opencode|agy|codex|copilot>'
   # variants: which command shapes this CLI can run.
@@ -449,6 +482,24 @@ cmd_install() {
       if [ "$1" = copilot ]; then orch_body '' ''; else sed '1,2d' "$src"; fi
     } > "$cdir/$name$cext"
   done
+
+  # The generated commands call `swarmforge/swarm`, so the tool has to live in
+  # the project, not only where it was installed from. Copy it in, plus the
+  # files it reads (roles, packs.conf, constitution.md) and the sources a
+  # re-install needs. Skip it when installing from that copy itself.
+  dest=$(pwd)/swarmforge
+  if [ "$DIR" != "$dest" ]; then
+    mkdir -p "$dest/roles" "$dest/commands"
+    cp "$DIR/swarm" "$DIR/packs.conf" "$DIR/constitution.md" "$dest/"
+    cp "$DIR"/roles/*.md "$dest/roles/"
+    cp "$DIR"/commands/*.md "$dest/commands/"
+    cp "$DIR/claude-settings.json" "$dest/"
+    printf 'swarm: toolkit -> %s/\n' "$dest"
+  fi
+
+  # The hook runs the project's own copy. $CLAUDE_PROJECT_DIR, not a relative
+  # path: a role may be working in a worktree that has no swarmforge/ of its own.
+  [ "$1" = claude ] && install_settings "$dest"
 
   # A pack-scoped model needs its own agent file to live in. Only the pack
   # overrides have one; `coder` is a single file shared by the 4- and 6-pack.
@@ -532,10 +583,10 @@ cmd_check() {
   check_role "$@" || exit 1
 }
 
-# check-hook -- for Claude Code's SubagentStop and TeammateIdle hooks. Exit 2 is
-# what Claude Code reads as "do not stop yet"; the message goes back to the role.
+# check-hook -- for Claude Code's SubagentStop hook. Exit 2 is what Claude Code
+# reads as "do not stop yet"; the message goes back to the role.
 #
-# These hooks fire for EVERY subagent, not only ours, so anything that is not a
+# The hook fires for EVERY subagent, not only ours, so anything that is not a
 # swarm role must exit 0 and get out of the way.
 cmd_check_hook() {
   # ponytail: sed, not jq - jq may not be installed. This breaks only on an
@@ -596,10 +647,9 @@ task_names() {
 
 # cmd_status <pack> ["<task>"] -- chain state, read off disk and nothing else.
 #
-# The team variant never passes reports through your window, and its
-# TeammateIdle hook may silently do nothing if the payload has no agent_type
-# (see README, "What this port does not do"). So this is the one view that does
-# not take the orchestrator's word for what is finished.
+# The team variant never passes reports through your window, and it has no hook
+# of its own. So this is the one view that does not take the orchestrator's word
+# for what is finished.
 #
 # done  - report names a commit HEAD still stands on
 # stale - a report is there but names no such commit: half-written, or its work
