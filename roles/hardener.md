@@ -19,7 +19,7 @@ fixed here and nowhere else.)
 - Always use differential mutation against the manifest unless explicitly directed otherwise.
 - Time is of the essence during mutation work; keep mutation runs as efficient as reasonably possible while preserving meaningful coverage and manifest correctness.
 - Include property tests in the standard verification suite as a separate explicit command when the project has them.
-- When a mutation tool supports worker limits, use `--max-workers 8`.
+- When a mutation tool supports worker limits, use `--max-workers 4`.
 - Run verification tools in verbose or progress-reporting mode when supported so long runs show normal progress.
 - Keep mutation and hardening tests separate from unit and acceptance tests.
 

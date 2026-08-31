@@ -49,7 +49,7 @@ Nothing here is preset. Work these out from the project itself.
 ### Language Defaults
 
 - For Clojure projects, prefer Babashka where possible.
-- For Clojure projects, prefer Speclj for unit and behavior tests.
+- For Clojure or Babashka projects, write Speclj specs, not `clojure.test`.
 - For Clojure or Babashka projects using Speclj, use `github.com/unclebob/speclj-structure-check` to validate test syntax. If a Speclj spec file changed, run the structure check before executing the relevant test command.
 - For Java projects, avoid using Maven to run tests; build dedicated test runners and run those instead.
 
@@ -69,7 +69,7 @@ language-local verification only: no Gherkin, no IR, no acceptance tests, no
 Gherkin mutation, no property tests.
 
 - Use github.com/unclebob/Acceptance-Pipeline-Specification for Gherkin acceptance tests.
-- The Acceptance Pipeline Specification supplies `gherkin-parser` and `gherkin-mutator`; install or build those commands from that repository instead of reimplementing them in the project.
+- The Acceptance Pipeline Specification supplies `gherkin-parser`, `ir-dry-checker`, and `gherkin-mutator`; install or build those commands from that repository instead of reimplementing them in the project. Install the ones your role is told to run.
 - Prefer the Babashka APS tools. Use Go-based APS tools only if the Babashka APS tools do not work in the current project environment.
 - Project-specific acceptance pipeline components are the acceptance entrypoint generator, acceptance runtime, project step handlers, runner adapter, and convenience scripts.
 - Gherkin acceptance mutation means running `gherkin-mutator` to mutate Gherkin example values.
@@ -78,6 +78,9 @@ Gherkin mutation, no property tests.
 ### Verification
 
 - Before running language, build, or test commands, prefer project-local cache and configuration paths inside the project. Avoid default cache locations that write outside the project and may trigger sandbox or permission restrictions.
+- Run the quality tools one at a time. Do not run CRAP, DRY, coverage, language mutation, Gherkin mutation, or the Speclj structure check at the same time as each other.
+- When a tool takes a worker limit, use `--max-workers 4` or `--workers 4`.
+- Language mutation is differential against the source manifest. Do not pass `--mutate-all`.
 - Run acceptance generation and acceptance tests sequentially.
 - Avoid running whole-suite language test commands concurrently with acceptance generation.
 - Run the relevant local verification command before every handoff.
@@ -86,6 +89,7 @@ Gherkin mutation, no property tests.
 
 ### Guardrails
 
+- Do not invent your own CRAP, DRY, mutation, or coverage stand-in. Install and run the tools named in the language table. A hand-written `bb crap`, `bb coverage`, or `bb mutation-count` task in the project is not one of those tools and does not count.
 - Do not edit mutation testing or Gherkin acceptance mutation manifests by hand; allow approved mutation tools to update those manifests as part of their normal runs.
 - Do not commit unrelated local changes or generated artifacts unless required for the task.
 - Before relying on an unfamiliar command, inspect local help or project documentation.
